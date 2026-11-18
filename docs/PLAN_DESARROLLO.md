@@ -6,65 +6,92 @@ App móvil que permite al usuario:
 
 1. Registrar su perfil físico (edad, sexo, peso, altura, nivel de actividad, FC en reposo).
 2. Elegir un tipo de ejercicio e iniciar una sesión.
-3. Vincular un smartwatch / banda pectoral y ver su **ritmo cardiaco en tiempo real** durante la actividad.
-4. Obtener una estimación de **calorías quemadas** basada en su perfil y, si hay datos, en su frecuencia cardiaca.
+3. Vincular su smartwatch y ver su **ritmo cardiaco en tiempo real** durante la actividad.
+4. Obtener una estimación de **calorías quemadas** basada en su perfil y en su frecuencia cardiaca.
 5. Consultar el historial y su progreso.
 
----
+### Dispositivos objetivo
 
-## 2. Decisiones técnicas propuestas
-
-| Área | Propuesta | Motivo |
+| Dispositivo | Sistema | Notas |
 |---|---|---|
-| App móvil | **React Native + Expo (dev build)**, TypeScript | Un solo código para Android e iOS; acceso a módulos nativos (BLE, HealthKit, Health Connect). |
-| Estado | Zustand + React Query | Simple, sin boilerplate. |
-| Persistencia local | SQLite (`expo-sqlite`) + Drizzle ORM | Funciona sin conexión; las sesiones nunca se pierden. |
-| Backend (fase 3) | Supabase (Postgres + Auth) | Sincronización entre dispositivos y respaldo, sin servidor propio al inicio. |
-| BLE | `react-native-ble-plx` | Lectura del perfil estándar *Heart Rate Service*. |
-| Salud del sistema | `react-native-health` (iOS HealthKit) y `react-native-health-connect` (Android) | Leer FC histórica y guardar los entrenamientos. |
-| Gráficas | `victory-native` o `react-native-gifted-charts` | FC en vivo y progreso. |
-| Pruebas | Jest + React Native Testing Library; Maestro para E2E | |
+| **Nothing Phone (3)** | Android (Nothing OS, con Google Play Services) | Health Connect viene integrado en el sistema. |
+| **Samsung Galaxy Watch6 Classic** | Wear OS (One UI Watch) | Se vincula al Nothing con la app *Galaxy Wearable* + *Samsung Health*. |
 
-> Alternativa: si se prefiere nativo puro, Kotlin (Android/Wear OS) + Swift (iOS/watchOS). Más trabajo, mejor integración con el reloj.
+Sin iOS por ahora: todo el proyecto es **Android + Wear OS**.
 
 ---
 
-## 3. Integración con smartwatch (el punto crítico)
+## 2. Decisiones técnicas
 
-Hay tres vías y **no son equivalentes** en latencia:
+Como el reloj es Wear OS y la app del reloj **tiene que ser nativa** (React Native/Flutter no tienen soporte real en Wear OS), lo más eficiente es hacer **todo en Kotlin** y compartir código entre teléfono y reloj.
 
-| Vía | Tiempo real | Dispositivos | Fase |
-|---|---|---|---|
-| **A. BLE Heart Rate Profile** (servicio `0x180D`, característica `0x2A37`) | Sí (~1 lectura/s) | Bandas pectorales (Polar, Garmin HRM, Wahoo), Polar/Coros/Suunto, Garmin con *"Transmitir FC"*, muchas pulseras genéricas | **MVP** |
-| **B. HealthKit / Health Connect** | No (datos con retraso de minutos) | Apple Watch, Wear OS, Samsung, Fitbit, Garmin (vía sus apps) | Fase 2 — historial y sincronización |
-| **C. App compañera en el reloj** (watchOS / Wear OS) | Sí | Apple Watch, Wear OS (Pixel, Galaxy Watch) | Fase 4 |
+| Área | Elección | Motivo |
+|---|---|---|
+| Lenguaje | **Kotlin** | Nativo en Android y Wear OS. |
+| UI teléfono | Jetpack Compose + Material 3 | |
+| UI reloj | Compose for Wear OS (pantalla redonda, bisel giratorio del Watch6 Classic con `rotaryScrollable`) | |
+| FC en el reloj | **Health Services — `ExerciseClient`** | API oficial de Wear OS para sesiones de ejercicio; FC ~1 lectura/s, funciona con pantalla apagada. |
+| Reloj ⇄ teléfono | **Wearable Data Layer API** (`MessageClient` para FC en vivo, `DataClient` para el resumen) | Usa la conexión Bluetooth que ya tiene el reloj con el teléfono. |
+| Datos de salud | **Health Connect** (`androidx.health.connect:connect-client`) | Leer peso, FC en reposo e historial de Samsung Health; escribir los entrenamientos. |
+| Persistencia | Room (SQLite) | Funciona sin conexión. |
+| Arquitectura | MVVM + Hilt + Coroutines/Flow | |
+| Gráficas | Vico | Gráficas en Compose. |
+| Backend (fase 4) | Supabase (Postgres + Auth) | Respaldo y sincronización, opcional. |
+| Pruebas | JUnit + Turbine (Flows), Compose UI tests | |
+| IDE | Android Studio (con emulador de Wear OS) | |
 
-**Importante:** el Apple Watch y la mayoría de relojes Wear OS **no emiten FC por BLE estándar**. Para FC en vivo con ellos hace falta la vía C (app en el reloj con `HKWorkoutSession` en watchOS o *Health Services* en Wear OS que envía datos al teléfono). Por eso el MVP empieza con BLE, que cubre el mayor número de dispositivos con menos esfuerzo.
+---
 
-### Flujo de vinculación BLE
-1. Pedir permisos (Bluetooth / ubicación en Android < 12, `BLUETOOTH_SCAN` + `BLUETOOTH_CONNECT` en Android 12+).
-2. Escanear filtrando por servicio `0x180D`.
-3. Conectar, suscribirse a notificaciones de `0x2A37` y decodificar (bit 0 del byte de flags: FC en 8 o 16 bits).
-4. Guardar el dispositivo para reconexión automática.
-5. Manejar desconexiones: reintentos, aviso al usuario, y la sesión continúa (cálculo por MET si no hay FC).
+## 3. Integración con el Galaxy Watch6 Classic
+
+### Lo que **no** sirve para FC en vivo
+- **Bluetooth estándar de FC (servicio `0x180D`)**: el Galaxy Watch no emite su ritmo cardiaco así de forma nativa.
+- **Health Connect / Samsung Health**: Samsung Health sincroniza con Health Connect con retraso (minutos). Sirve para el historial, no para el ritmo durante la actividad.
+
+### Lo que sí: app propia en el reloj
+```
+[Galaxy Watch6]                                   [Nothing Phone 3]
+ App Wear OS                                        App Android
+  ExerciseClient (Health Services)                   WearableListenerService
+   └─ FC cada ~1 s ──► MessageClient ──Bluetooth──►   └─ calcula calorías, zonas
+  Pantalla: FC, zona, tiempo                         Pantalla en vivo + gráfica
+  Controles: iniciar / pausar / terminar  ◄──────►   Controles espejo
+                                                     Al terminar: Room + Health Connect
+```
+
+- El **reloj es la fuente de verdad durante la sesión**: guarda las muestras localmente, así no se pierde nada si el teléfono se desconecta, y las reenvía al reconectar.
+- Ambas apps comparten el mismo `applicationId` y firma (requisito del Data Layer).
+- Se puede iniciar la sesión desde el reloj o desde el teléfono.
+- `ExerciseClient` también entrega sus propias calorías estimadas: las guardaremos para comparar con nuestro cálculo.
+- **Samsung Health Sensor SDK** (acceso a sensores en bruto, IBI/HRV): opcional y más adelante; para publicar requiere aprobación de Samsung. No hace falta para el objetivo actual.
+
+### Permisos
+- Reloj: `BODY_SENSORS` (o `health.READ_HEART_RATE` en Wear OS 5+), `ACTIVITY_RECOGNITION`, `FOREGROUND_SERVICE_HEALTH`.
+- Teléfono: permisos de Health Connect (lectura de peso/FC, escritura de ejercicio), `POST_NOTIFICATIONS`.
+
+### Entorno de pruebas en tu hardware
+1. Reloj: *Ajustes → Información del reloj → Software* → tocar 7 veces "Versión de software" para activar opciones de desarrollador.
+2. Activar **Depuración ADB** y **Depuración por Wi-Fi** en el reloj; conectar con `adb pair` / `adb connect` desde Android Studio.
+3. Teléfono: activar depuración USB en el Nothing Phone.
+4. Al principio se puede usar el emulador de Wear OS con datos de FC sintéticos (Health Services los simula).
 
 ---
 
 ## 4. Cálculo de calorías
 
-El motor de cálculo será un módulo puro en TypeScript (`src/domain/calories.ts`), sin dependencias de UI, con pruebas unitarias.
+Módulo Kotlin puro (`:core:domain`), sin dependencias de Android, compartido por ambas apps y con pruebas unitarias.
 
-### 4.1 Con frecuencia cardiaca (método preferido) — Keytel et al., 2005
+### 4.1 Con frecuencia cardiaca (método principal) — Keytel et al., 2005
 Por minuto, con FC = frecuencia media del intervalo, P = peso (kg), E = edad (años):
 
 - **Hombres:** `kcal/min = (-55.0969 + 0.6309·FC + 0.1988·P + 0.2017·E) / 4.184`
 - **Mujeres:** `kcal/min = (-20.4022 + 0.4472·FC - 0.1263·P + 0.0740·E) / 4.184`
 
-Se integra cada 5–10 s con la FC de ese tramo. Válido aprox. para FC entre 90 y 150 lpm; fuera de ese rango se combina con el método MET.
+Se integra cada 5–10 s. Válido aprox. para FC entre 90 y 150 lpm; fuera de ese rango (o si se pierde la señal) se usa el método MET.
 
 ### 4.2 Sin frecuencia cardiaca — método MET corregido
 - `kcal = MET × 3.5 × P / 200 × minutos`
-- **Corrección por perfil:** se calcula el metabolismo basal con **Mifflin-St Jeor** (usa peso, altura, edad y sexo) y se ajusta el MET: `MET_corregido = MET × 3.5 / VO2_reposo_individual`, donde `VO2_reposo = (TMB / 1440 / 5) / P × 1000` (ml/kg/min). Así la altura y la edad influyen aunque no haya reloj.
+- **Corrección por perfil:** metabolismo basal con **Mifflin-St Jeor** (peso, altura, edad, sexo) y `MET_corregido = MET × 3.5 / VO2_reposo_individual`, donde `VO2_reposo = (TMB / 1440 / 5) / P × 1000` (ml/kg/min).
 - Valores MET del *Compendium of Physical Activities* (Ainsworth). Ejemplos:
 
 | Ejercicio | MET |
@@ -79,9 +106,9 @@ Se integra cada 5–10 s con la FC de ese tramo. Válido aprox. para FC entre 90
 | Yoga | 2.5 |
 
 ### 4.3 Datos derivados
-- **FC máxima:** Tanaka `208 − 0.7 × edad` (editable por el usuario).
-- **Zonas de FC:** método Karvonen con FC en reposo (Z1 50–60 % … Z5 90–100 %).
-- **IMC** informativo en el perfil.
+- **FC máxima:** Tanaka `208 − 0.7 × edad` (editable).
+- **FC en reposo:** leída de Health Connect (Samsung Health la mide) o introducida a mano.
+- **Zonas de FC:** Karvonen (Z1 50–60 % … Z5 90–100 %), con vibración en el reloj al cambiar de zona.
 
 > Mostrar siempre que las calorías son una **estimación**, no un dato médico.
 
@@ -91,42 +118,44 @@ Se integra cada 5–10 s con la FC de ese tramo. Válido aprox. para FC entre 90
 
 ```
 UserProfile   { id, birthDate, sex, weightKg, heightCm, restingHr?, maxHrOverride?, units }
-ExerciseType  { id, name, icon, met, category, usesGps }
-Device        { id, name, bleId, type, lastConnectedAt }
+ExerciseType  { id, name, icon, met, category, healthServicesType, usesGps }
 Workout       { id, exerciseTypeId, startedAt, endedAt, durationSec, avgHr, maxHr,
-                calories, calorieMethod ('hr'|'met'|'mixed'), distanceM?, notes? }
+                calories, calorieMethod ('hr'|'met'|'mixed'), watchCalories?,
+                distanceM?, source ('watch'|'phone'), notes? }
 HrSample      { workoutId, timestamp, bpm }
-WeightLog     { date, weightKg }   // las calorías usan el peso vigente en la fecha
+WeightLog     { date, weightKg }
 ```
 
 ---
 
 ## 6. Pantallas
 
-1. **Onboarding / Perfil** — datos físicos, unidades (kg/lb, cm/ft).
-2. **Inicio** — resumen de la semana, botón "Empezar actividad".
-3. **Selección de ejercicio** — lista con búsqueda y favoritos.
-4. **Dispositivos** — escanear, vincular, estado de batería y conexión.
-5. **Sesión en curso** — cronómetro, FC grande con color de zona, gráfica en vivo, calorías acumuladas, pausar/reanudar/terminar. Pantalla siempre encendida.
-6. **Resumen de sesión** — tiempo, FC media/máx, tiempo por zona, calorías, método usado.
-7. **Historial y estadísticas** — lista, filtros por tipo, gráficas semanales/mensuales.
-8. **Ajustes** — permisos, exportación, Health Connect / HealthKit.
+**Teléfono**
+1. Onboarding / Perfil (con opción de importar peso y altura desde Health Connect).
+2. Inicio — resumen semanal, estado del reloj, botón "Empezar actividad".
+3. Selección de ejercicio — lista con búsqueda y favoritos.
+4. Sesión en curso — cronómetro, FC grande con color de zona, gráfica en vivo, calorías.
+5. Resumen de sesión — FC media/máx, tiempo por zona, calorías (nuestras vs. del reloj).
+6. Historial y estadísticas.
+7. Ajustes — permisos, Health Connect, exportación.
+
+**Reloj**
+1. Lista de ejercicios (navegable con el bisel).
+2. Sesión: FC, zona, tiempo, calorías; pausar/terminar.
+3. Resumen breve.
+4. *Tile* y *complicación* de Wear OS para iniciar rápido (fase 5).
 
 ---
 
-## 7. Estructura del proyecto
+## 7. Estructura del proyecto (Gradle multi-módulo)
 
 ```
-src/
-  app/            # pantallas (expo-router)
-  components/
-  domain/         # calories.ts, heartRateZones.ts, metTable.ts  ← lógica pura con tests
-  services/
-    ble/          # escaneo, conexión, parser 0x2A37
-    health/       # HealthKit / Health Connect
-    workout/      # máquina de estados de la sesión (idle → running ⇄ paused → finished)
-  db/             # esquema y migraciones SQLite
-  store/
+app/              # app del teléfono (Compose)
+wear/             # app del reloj (Compose for Wear OS + Health Services)
+core/
+  domain/         # calories.kt, heartRateZones.kt, metTable.kt  ← Kotlin puro + tests
+  data/           # Room, repositorios, Health Connect
+  wearcomm/       # rutas y modelos de mensajes del Data Layer (compartido)
 docs/
 ```
 
@@ -135,38 +164,38 @@ docs/
 ## 8. Fases y entregables
 
 ### Fase 0 — Preparación (≈1 semana)
-- Inicializar Expo + TypeScript, ESLint/Prettier, CI con GitHub Actions (lint + tests).
-- Development build en Android e iOS (BLE no funciona en Expo Go).
-- **Criterio de salida:** la app arranca en un dispositivo físico desde CI/local.
+- Proyecto Android Studio con módulos `app`, `wear`, `core:*`.
+- CI con GitHub Actions (build + tests).
+- Activar depuración en el Nothing Phone y en el Galaxy Watch6; desplegar un "hola mundo" en ambos.
+- **Criterio de salida:** ambas apps instaladas desde Android Studio en tus dispositivos.
 
-### Fase 1 — MVP sin reloj (≈2 semanas)
-- Perfil de usuario y persistencia local.
+### Fase 1 — App del teléfono sin reloj (≈2 semanas)
+- Perfil y persistencia local (Room).
 - Catálogo de ejercicios con MET.
 - Sesión con cronómetro y cálculo MET corregido.
 - Resumen e historial básico.
-- Tests unitarios del motor de calorías con casos de referencia.
-- **Criterio de salida:** registrar una sesión completa y verla en el historial.
+- Tests unitarios del motor de calorías.
+- **Criterio de salida:** registrar una sesión y verla en el historial.
 
-### Fase 2 — Smartwatch por BLE (≈2–3 semanas)
-- Pantalla de dispositivos: escaneo, vinculación, reconexión.
-- FC en vivo en la sesión, gráfica y zonas.
-- Cálculo de calorías por FC (Keytel) con respaldo MET si se pierde la señal.
-- Guardado de muestras de FC.
-- **Criterio de salida:** sesión de 30 min con banda pectoral sin cortes; calorías dentro de ±15 % de lo que reporta el propio dispositivo.
+### Fase 2 — App del reloj con FC en vivo (≈3 semanas)
+- App Wear OS con `ExerciseClient`: iniciar, pausar, terminar, FC en vivo.
+- Servicio en primer plano para que la sesión siga con la pantalla apagada.
+- Envío de FC al teléfono por `MessageClient`; resumen final por `DataClient`.
+- Teléfono: FC en vivo, gráfica, zonas, calorías por Keytel con respaldo MET.
+- Reconexión: muestras guardadas en el reloj y reenviadas.
+- **Criterio de salida:** sesión de 30 min caminando/corriendo con el Watch6 sin huecos de datos; calorías dentro de ±15 % de las de Samsung Health para la misma actividad.
 
-### Fase 3 — Plataformas de salud + nube (≈2–3 semanas)
-- Health Connect (Android) y HealthKit (iOS): leer peso, FC en reposo e historial; escribir entrenamientos.
-- Cuenta de usuario y sincronización con Supabase.
+### Fase 3 — Health Connect (≈1–2 semanas)
+- Leer peso, altura y FC en reposo (desde Samsung Health).
+- Escribir los entrenamientos (`ExerciseSessionRecord`, `HeartRateRecord`, `TotalCaloriesBurnedRecord`).
 - Estadísticas semanales/mensuales.
-- **Criterio de salida:** un entrenamiento hecho en la app aparece en Google Fit/Salud de Apple.
+- **Criterio de salida:** un entrenamiento de la app aparece en Health Connect y en Samsung Health.
 
-### Fase 4 — Apps en el reloj (≈4+ semanas)
-- App watchOS (Swift, `HKWorkoutSession` + `WatchConnectivity`).
-- App Wear OS (Kotlin, *Health Services* + *Data Layer API*).
-- Iniciar/terminar la sesión desde el reloj.
+### Fase 4 — Nube (opcional, ≈2 semanas)
+- Cuenta de usuario y sincronización con Supabase.
 
 ### Fase 5 — Extras
-- GPS y mapa para correr/bici, metas y rachas, notificaciones, alertas de zona por vibración, exportación GPX/CSV, modo oscuro, localización.
+- GPS (reloj o teléfono) y mapa para correr/bici, metas y rachas, Tile y complicación en el reloj, alertas de zona por vibración, exportación GPX/CSV, HRV con Samsung Health Sensor SDK, soporte para bandas pectorales BLE.
 
 ---
 
@@ -174,15 +203,15 @@ docs/
 
 | Riesgo | Mitigación |
 |---|---|
-| Apple Watch / Wear OS no transmiten FC por BLE | Comunicarlo en la UI; Fase 4 con apps nativas en el reloj. |
-| Sistema mata la app en segundo plano durante la sesión | Servicio en primer plano (Android) y modo *background BLE* (iOS); probar en pantalla bloqueada. |
-| Precisión de calorías | Documentar las fórmulas, mostrar el método usado, tests con valores de referencia. |
-| Datos de salud sensibles | Datos locales por defecto, cifrado en reposo, consentimiento explícito, cumplimiento de políticas de las tiendas para HealthKit/Health Connect. |
-| Fragmentación de permisos BLE en Android | Capa de permisos centralizada y probada en Android 10, 12 y 14. |
+| Ahorro de batería de Nothing OS / One UI Watch cierra las apps en segundo plano | Servicio en primer plano con notificación en ambos lados; pedir excluir la app de la optimización de batería; probar con pantalla bloqueada. |
+| Pérdida de conexión reloj ⇄ teléfono | El reloj guarda la sesión completa y sincroniza al reconectar. |
+| Galaxy Watch con teléfono no Samsung | Las funciones necesarias (Wear OS, Health Services, Data Layer) no dependen de un teléfono Samsung. Solo ECG/presión arterial lo requieren, y no se usan. |
+| Precisión de calorías | Fórmulas documentadas, mostrar el método usado, comparar con las calorías del reloj, tests con valores de referencia. |
+| Datos de salud sensibles | Datos locales por defecto, consentimiento explícito y política de privacidad (Google Play la exige para Health Connect y sensores corporales). |
 
 ---
 
 ## 10. Próximos pasos inmediatos
-1. Confirmar el stack (React Native/Expo vs. nativo).
-2. Definir qué relojes/bandas tiene el equipo para pruebas.
+1. Instalar Android Studio (con SDK de Wear OS) si aún no está.
+2. Activar depuración en el Nothing Phone 3 y el Galaxy Watch6 Classic.
 3. Iniciar la Fase 0.
